@@ -1,0 +1,11 @@
+services:
+  kafka:
+    image: apache/kafka:4.1.2
+    ports:
+      - "127.0.0.1:9092:9092"
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s

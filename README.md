@@ -25,6 +25,22 @@ The normalizer turns both JSON formats into the same `TradeReport` record. The c
 
 Each report needs a nonblank trade reference, a positive 32-bit version, and a positive whole-share quantity that fits in a signed 64-bit integer. Extra fields are allowed. Malformed reports, duplicate JSON properties, and missing or invalid required fields raise a `FormatException` with a reason.
 
+## Run the Kafka demo
+
+With Docker and the Compose plugin available, run these commands from the repository root:
+
+```sh
+docker compose up -d --wait
+dotnet run --project src/TradeReconciliation.KafkaDemo
+docker compose down
+```
+
+The demo can also use an existing Kafka broker. Set `KAFKA_BOOTSTRAP_SERVERS` if its address differs from `localhost:9092`. The broker must allow topic creation, or already have the `trade-reports.demo` topic.
+
+The producer puts all three raw reports on one demo topic, keyed by trade reference. A message header identifies the feed format. Kafka preserves the order of the reports within the partition. The consumer starts at the first offset published by this run, skips other runs' trade keys, and passes each report through the existing normalizer and reconciler. The output shows `WaitingForBroker`, `Mismatched`, and `Matched`, with the same break ID printed first as `Open` and then as `AutoResolved`.
+
+The demo uses one broker and in-memory state. It reads only its own three reports and does not commit consumer offsets. Durable storage and restart recovery are later checkpoints.
+
 ## Project status
 
-The local tests cover both JSON formats, validation, and a complete report-to-correction example. Kafka messaging, PostgreSQL storage, and monitoring are planned.
+The project has an in-memory quantity reconciler, two JSON feed adapters, and a local Kafka demo. PostgreSQL storage and monitoring are planned.
