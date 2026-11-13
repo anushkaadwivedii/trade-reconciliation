@@ -29,7 +29,8 @@ public sealed record TradeReport(
     string TradeRef,
     TradeSource Source,
     int Version,
-    long Quantity);
+    long Quantity,
+    decimal? Price = null);
 
 public sealed record QuantityBreak(
     Guid Id,
@@ -37,9 +38,18 @@ public sealed record QuantityBreak(
     long BrokerQuantity,
     BreakStatus Status);
 
+public sealed record PriceBreak(
+    Guid Id,
+    decimal InternalPrice,
+    decimal BrokerPrice,
+    BreakStatus Status);
+
 public sealed record ReconciliationResult(
     ReconciliationStatus Status,
-    IReadOnlyList<QuantityBreak> Breaks);
+    IReadOnlyList<QuantityBreak> Breaks)
+{
+    public IReadOnlyList<PriceBreak> PriceBreaks { get; init; } = Array.Empty<PriceBreak>();
+}
 
 public sealed class TradeReconciler
 {
@@ -103,17 +113,52 @@ public sealed class TradeReconciler
                 BreakStatus.Open));
         }
 
-        var status = quantitiesMatch
+        var priceMismatch = UpdatePriceBreak(trade, internalReport, brokerReport);
+        var status = quantitiesMatch && !priceMismatch
             ? ReconciliationStatus.Matched
             : ReconciliationStatus.Mismatched;
 
-        return new ReconciliationResult(status, Array.AsReadOnly(trade.Breaks.ToArray()));
+        return new ReconciliationResult(status, Array.AsReadOnly(trade.Breaks.ToArray()))
+        {
+            PriceBreaks = Array.AsReadOnly(trade.PriceBreaks.ToArray())
+        };
+    }
+
+    private static bool UpdatePriceBreak(TradeState trade, TradeReport internalReport, TradeReport brokerReport)
+    {
+        var hasOpenBreak = trade.PriceBreaks.Count > 0 && trade.PriceBreaks[^1].Status == BreakStatus.Open;
+        if (internalReport.Price is not decimal internalPrice || brokerReport.Price is not decimal brokerPrice)
+        {
+            // A missing price cannot confirm that an open break is fixed.
+            return hasOpenBreak;
+        }
+
+        if (internalPrice == brokerPrice)
+        {
+            if (hasOpenBreak)
+            {
+                trade.PriceBreaks[^1] = trade.PriceBreaks[^1] with { Status = BreakStatus.AutoResolved };
+            }
+
+            return false;
+        }
+
+        if (!hasOpenBreak)
+        {
+            trade.PriceBreaks.Add(new PriceBreak(
+                CreateBreakId(internalReport.TradeRef, trade.PriceBreaks.Count + 1, ":price"),
+                internalPrice,
+                brokerPrice,
+                BreakStatus.Open));
+        }
+
+        return true;
     }
 
     // The same ordered reports produce the same break IDs when replayed.
-    private static Guid CreateBreakId(string tradeRef, int breakNumber)
+    private static Guid CreateBreakId(string tradeRef, int breakNumber, string suffix = "")
     {
-        var key = FormattableString.Invariant($"{tradeRef}:{breakNumber}");
+        var key = FormattableString.Invariant($"{tradeRef}:{breakNumber}{suffix}");
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(key));
         return new Guid(hash.AsSpan(0, 16));
     }
@@ -123,5 +168,6 @@ public sealed class TradeReconciler
         public TradeReport? Internal { get; set; }
         public TradeReport? Broker { get; set; }
         public List<QuantityBreak> Breaks { get; } = new();
+        public List<PriceBreak> PriceBreaks { get; } = new();
     }
 }

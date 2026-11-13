@@ -2,7 +2,7 @@
 
 Trade Reconciliation is a C# portfolio project that compares a firm's trade reports with a broker's reports and tracks differences through corrections.
 
-The current checkpoint is an in-memory reconciler for one internal source and one broker. Reports for the same trade are matched by trade reference. The reconciler keeps the highest version received from each source and compares quantities when both sides have reported. It keeps each quantity break in history when a later report resolves it.
+The current checkpoint is an in-memory reconciler for one internal source and one broker. Reports for the same trade are matched by trade reference. The reconciler keeps the highest version received from each source and compares quantities and available prices when both sides have reported. It keeps each quantity break in history when a later report resolves it.
 
 ## Run the tests
 
@@ -20,10 +20,10 @@ The normalizer turns both JSON formats into the same `TradeReport` record. The c
 
 | Feed | Example |
 | --- | --- |
-| Internal | `{"tradeRef":"TRADE-001","version":1,"quantity":100}` |
-| Broker A | `{"execution_id":"TRADE-001","revision":1,"qty":90}` |
+| Internal | `{"tradeRef":"TRADE-001","version":1,"quantity":100,"price":10.01}` |
+| Broker A | `{"execution_id":"TRADE-001","revision":1,"qty":90,"px":10.02}` |
 
-Each report needs a nonblank trade reference, a positive 32-bit version, and a positive whole-share quantity that fits in a signed 64-bit integer. Extra fields are allowed. Malformed reports, duplicate JSON properties, and missing or invalid required fields raise a `FormatException` with a reason.
+Each report needs a nonblank trade reference, a positive 32-bit version, and a positive whole-share quantity that fits in a signed 64-bit integer. Prices are optional for compatibility with earlier reports. If supplied, a price must be a positive JSON number in plain decimal notation with up to 10 whole digits and 8 fractional digits. C# compares prices exactly using `decimal`, assuming both feeds use the same currency. When either price is missing, the reconciler skips price comparison and keeps any existing price break open. Extra fields are allowed. Malformed reports, duplicate JSON properties, and missing or invalid required fields raise a `FormatException` with a reason.
 
 ## Run the Kafka demo
 
@@ -51,7 +51,7 @@ TRADE_DB_CONNECTION='Host=localhost;Port=5432;Database=trades;Username=trade_dem
   dotnet run --project src/TradeReconciliation.KafkaDemo
 ```
 
-The Compose credentials are only for this local demo. For an existing database, provide its connection string through `TRADE_DB_CONNECTION`. The demo needs permission to create its tables. It applies `db/migrations/001_trade_history.sql` on startup and uses parameterized SQL through Npgsql's ADO.NET API to save each report and its break changes in one transaction. The report log keeps each version, and a resolved break keeps the original 100-versus-90 quantities and its opening and resolution times.
+The Compose credentials are only for this local demo. For an existing database, provide its connection string through `TRADE_DB_CONNECTION`. The demo needs permission to create its tables. It applies the SQL files in `db/migrations/` on startup and uses parameterized SQL through Npgsql's ADO.NET API to save each report and its break changes in one transaction. The report log keeps each version, and a resolved break keeps the original 100-versus-90 quantities and its opening and resolution times.
 
 After the demo exits, open a SQL prompt and replace `DEMO-...` with the reference it printed:
 
@@ -60,13 +60,17 @@ docker compose exec postgres psql -U trade_demo -d trades
 ```
 
 ```sql
-SELECT source, version, quantity, status_after_report
+SELECT source, version, quantity, price, status_after_report
 FROM trade_reports
 WHERE trade_ref = 'DEMO-...'
 ORDER BY report_id;
 
 SELECT break_id, internal_quantity, broker_quantity, status, opened_at, resolved_at
 FROM quantity_breaks
+WHERE trade_ref = 'DEMO-...';
+
+SELECT break_id, internal_price, broker_price, status, opened_at, resolved_at
+FROM price_breaks
 WHERE trade_ref = 'DEMO-...';
 ```
 
@@ -89,7 +93,7 @@ dotnet run --project src/TradeReconciliation.KafkaDemo -- --publish-only
 
 The worker listens on `trade-reports.live`, separate from the one-shot demo topic. It uses the `trade-reconciliation-worker` consumer group by default. Keep the group and database the same when restarting so the worker resumes from the saved Kafka offset. Set `KAFKA_CONSUMER_GROUP` for a separate group.
 
-For each report, the worker rebuilds that trade's state from its PostgreSQL history in arrival order, applies the new report, and saves it with its break changes in one transaction. Then it commits the Kafka offset. If the same source and version arrive again with the same quantity, the worker advances the offset without adding another row or changing the break. This is at-least-once delivery with idempotent database writes.
+For each report, the worker rebuilds that trade's state from its PostgreSQL history in arrival order, applies the new report, and saves it with its break changes in one transaction. Then it commits the Kafka offset. If the same source and version arrive again with the same quantity and price, the worker advances the offset without adding another row or changing the break. This is at-least-once delivery with idempotent database writes.
 
 Replaying one trade's history for each new report keeps the recovery logic small for this checkpoint. A more efficient current-state projection is future work.
 

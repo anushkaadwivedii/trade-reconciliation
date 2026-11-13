@@ -62,9 +62,9 @@ try
     var tradeRef = $"DEMO-{Guid.NewGuid():N}";
     var reports = new (TradeSource Source, string Payload)[]
     {
-        (TradeSource.Internal, $$"""{"tradeRef":"{{tradeRef}}","version":1,"quantity":100}"""),
-        (TradeSource.BrokerA, $$"""{"execution_id":"{{tradeRef}}","revision":1,"qty":90}"""),
-        (TradeSource.BrokerA, $$"""{"execution_id":"{{tradeRef}}","revision":2,"qty":100}""")
+        (TradeSource.Internal, $$"""{"tradeRef":"{{tradeRef}}","version":1,"quantity":100,"price":10.01}"""),
+        (TradeSource.BrokerA, $$"""{"execution_id":"{{tradeRef}}","revision":1,"qty":90,"px":10.02}"""),
+        (TradeSource.BrokerA, $$"""{"execution_id":"{{tradeRef}}","revision":2,"qty":100,"px":10.01}""")
     };
 
     using var producer = new ProducerBuilder<string, string>(new ProducerConfig
@@ -124,6 +124,12 @@ try
         {
             Console.WriteLine(
                 $"  Break {quantityBreak.Id}: {quantityBreak.InternalQuantity} vs {quantityBreak.BrokerQuantity} ({quantityBreak.Status})");
+        }
+
+        foreach (var priceBreak in result.PriceBreaks)
+        {
+            Console.WriteLine(FormattableString.Invariant(
+                $"  Price break {priceBreak.Id}: {priceBreak.InternalPrice} vs {priceBreak.BrokerPrice} ({priceBreak.Status})"));
         }
 
         processed++;

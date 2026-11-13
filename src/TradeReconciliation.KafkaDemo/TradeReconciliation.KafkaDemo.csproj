@@ -12,5 +12,6 @@
     <PackageReference Include="Npgsql" Version="10.0.3" />
     <ProjectReference Include="../TradeReconciliation/TradeReconciliation.csproj" />
     <EmbeddedResource Include="../../db/migrations/001_trade_history.sql" LogicalName="TradeHistory.sql" />
+    <EmbeddedResource Include="../../db/migrations/002_price_history.sql" LogicalName="PriceHistory.sql" />
   </ItemGroup>
 </Project>

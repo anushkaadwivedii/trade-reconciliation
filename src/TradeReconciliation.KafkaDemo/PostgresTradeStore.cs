@@ -1,4 +1,5 @@
 using Npgsql;
+using NpgsqlTypes;
 
 namespace TradeReconciliation.KafkaDemo;
 
@@ -6,12 +7,6 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
 {
     public async Task InitializeAsync(CancellationToken cancellationToken)
     {
-        await using var schema = typeof(PostgresTradeStore).Assembly
-            .GetManifestResourceStream("TradeHistory.sql")
-            ?? throw new InvalidOperationException("The trade history schema is missing.");
-        using var reader = new StreamReader(schema);
-        var sql = await reader.ReadToEndAsync(cancellationToken);
-
         await using var connection = await database.OpenConnectionAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
 
@@ -20,8 +15,15 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
             "SELECT pg_advisory_xact_lock(829316054)", connection, transaction);
         await schemaLock.ExecuteNonQueryAsync(cancellationToken);
 
-        await using var command = new NpgsqlCommand(sql, connection, transaction);
-        await command.ExecuteNonQueryAsync(cancellationToken);
+        foreach (var resource in new[] { "TradeHistory.sql", "PriceHistory.sql" })
+        {
+            await using var schema = typeof(PostgresTradeStore).Assembly.GetManifestResourceStream(resource)
+                ?? throw new InvalidOperationException($"Missing database schema {resource}.");
+            using var reader = new StreamReader(schema);
+            var sql = await reader.ReadToEndAsync(cancellationToken);
+            await using var command = new NpgsqlCommand(sql, connection, transaction);
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
         await transaction.CommitAsync(cancellationToken);
     }
 
@@ -54,7 +56,7 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
 
         var reconciler = new TradeReconciler();
         await using var history = new NpgsqlCommand("""
-            SELECT source, version, quantity
+            SELECT source, version, quantity, price
             FROM trade_reports
             WHERE trade_ref = $1
             ORDER BY report_id
@@ -70,18 +72,19 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
                 var source = Enum.Parse<TradeSource>(rows.GetString(0));
                 var version = rows.GetInt32(1);
                 var quantity = rows.GetInt64(2);
+                decimal? price = rows.IsDBNull(3) ? null : rows.GetDecimal(3);
                 if (source == report.Source && version == report.Version)
                 {
-                    if (quantity != report.Quantity)
+                    if (quantity != report.Quantity || price != report.Price)
                     {
-                        throw new FormatException("Report repeats a saved version with a different quantity.");
+                        throw new FormatException("Report repeats a saved version with a different quantity or price.");
                     }
 
                     // PostgreSQL already committed this report and its break changes.
                     return null;
                 }
 
-                reconciler.Apply(new TradeReport(report.TradeRef, source, version, quantity));
+                reconciler.Apply(new TradeReport(report.TradeRef, source, version, quantity, price));
             }
         }
 
@@ -99,8 +102,8 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
         CancellationToken cancellationToken)
     {
         const string insertReport = """
-            INSERT INTO trade_reports (trade_ref, source, version, quantity, status_after_report)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO trade_reports (trade_ref, source, version, quantity, status_after_report, price)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (trade_ref, source, version) DO NOTHING
             """;
 
@@ -112,7 +115,8 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
                 new() { Value = report.Source.ToString() },
                 new() { Value = report.Version },
                 new() { Value = report.Quantity },
-                new() { Value = result.Status.ToString() }
+                new() { Value = result.Status.ToString() },
+                new() { NpgsqlDbType = NpgsqlDbType.Numeric, Value = (object?)report.Price ?? DBNull.Value }
             }
         };
 
@@ -124,6 +128,11 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
         foreach (var quantityBreak in result.Breaks)
         {
             await SaveBreakAsync(connection, transaction, report.TradeRef, quantityBreak, cancellationToken);
+        }
+
+        foreach (var priceBreak in result.PriceBreaks)
+        {
+            await SavePriceBreakAsync(connection, transaction, report.TradeRef, priceBreak, cancellationToken);
         }
     }
 
@@ -151,6 +160,35 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
                 new() { Value = quantityBreak.InternalQuantity },
                 new() { Value = quantityBreak.BrokerQuantity },
                 new() { Value = quantityBreak.Status.ToString() }
+            }
+        };
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task SavePriceBreakAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        string tradeRef,
+        PriceBreak priceBreak,
+        CancellationToken cancellationToken)
+    {
+        const string upsertBreak = """
+            INSERT INTO price_breaks (break_id, trade_ref, internal_price, broker_price, status, resolved_at)
+            VALUES ($1, $2, $3, $4, $5, CASE WHEN $5 = 'AutoResolved' THEN CURRENT_TIMESTAMP END)
+            ON CONFLICT (break_id) DO UPDATE
+            SET status = EXCLUDED.status, resolved_at = EXCLUDED.resolved_at
+            WHERE price_breaks.status = 'Open' AND EXCLUDED.status = 'AutoResolved'
+            """;
+
+        await using var command = new NpgsqlCommand(upsertBreak, connection, transaction)
+        {
+            Parameters =
+            {
+                new() { Value = priceBreak.Id },
+                new() { Value = tradeRef },
+                new() { Value = priceBreak.InternalPrice },
+                new() { Value = priceBreak.BrokerPrice },
+                new() { Value = priceBreak.Status.ToString() }
             }
         };
         await command.ExecuteNonQueryAsync(cancellationToken);

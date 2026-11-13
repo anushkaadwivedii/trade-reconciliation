@@ -1,5 +1,6 @@
 using System;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace TradeReconciliation;
 
@@ -9,10 +10,10 @@ public static class TradeReportNormalizer
     {
         ArgumentNullException.ThrowIfNull(payload);
 
-        var (referenceField, versionField, quantityField) = source switch
+        var (referenceField, versionField, quantityField, priceField) = source switch
         {
-            TradeSource.Internal => ("tradeRef", "version", "quantity"),
-            TradeSource.BrokerA => ("execution_id", "revision", "qty"),
+            TradeSource.Internal => ("tradeRef", "version", "quantity", "price"),
+            TradeSource.BrokerA => ("execution_id", "revision", "qty", "px"),
             _ => throw new ArgumentOutOfRangeException(nameof(source), source, "Unsupported trade source.")
         };
 
@@ -33,7 +34,8 @@ public static class TradeReportNormalizer
                 ReadTradeReference(root, referenceField),
                 source,
                 (int)ReadPositiveInteger(root, versionField, int.MaxValue),
-                ReadPositiveInteger(root, quantityField, long.MaxValue));
+                ReadPositiveInteger(root, quantityField, long.MaxValue),
+                ReadOptionalPrice(root, priceField));
         }
         catch (JsonException exception)
         {
@@ -54,6 +56,25 @@ public static class TradeReportNormalizer
         }
 
         throw new FormatException($"Field '{field}' must be a nonblank string.");
+    }
+
+    private static decimal? ReadOptionalPrice(JsonElement root, string field)
+    {
+        if (!root.TryGetProperty(field, out var element))
+        {
+            return null;
+        }
+
+        // Check the raw digits before conversion to avoid rounding in .NET or PostgreSQL.
+        if (element.ValueKind == JsonValueKind.Number
+            && Regex.IsMatch(element.GetRawText(), @"\A[0-9]{1,10}(\.[0-9]{1,8})?\z")
+            && element.TryGetDecimal(out var price)
+            && price > 0)
+        {
+            return price;
+        }
+
+        throw new FormatException($"Field '{field}' must be a positive decimal with up to 10 whole and 8 fractional digits.");
     }
 
     private static long ReadPositiveInteger(JsonElement root, string field, long maxValue)
