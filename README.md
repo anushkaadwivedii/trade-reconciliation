@@ -109,6 +109,14 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
 
 A crash after Kafka saves a rejection but before the input offset is committed can publish the same rejection again. The dead-letter key (`topic:partition:offset`) identifies the original Kafka record so consumers can recognize repeated entries.
 
+## Missing-report grace period
+
+The domain library includes a `MissingReportTracker` for the two feeds. It takes a configurable grace period, each trade's execution time, and explicit event-time watermarks. A watermark is a feed's statement about how far it has progressed. A trade that only one side has reported becomes a missing-report break when the **other** feed's watermark moves strictly past the execution time plus the grace period.
+
+For example, with a 30-second grace period and an internal trade at 14:00:00, a broker watermark of 14:00:30 leaves the trade waiting. A broker watermark of 14:00:31 opens a break. A later broker report for the same trade resolves it. A break is identified by its trade reference and missing source. Repeated reports and older watermarks do not emit duplicate changes.
+
+The tracker is currently exercised by domain tests. Feed timestamp parsing, watermark delivery through Kafka, and database storage for missing-report breaks are planned.
+
 ## Project status
 
 The project normalizes and reconciles two JSON feeds, publishes reports through Kafka, and stores trade and mismatch history in PostgreSQL. The continuous worker resumes from Kafka's saved position and uses PostgreSQL to rebuild trade state after restart. Rejected reports are available in a separate Kafka topic.
