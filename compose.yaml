@@ -9,3 +9,22 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: trades
+      POSTGRES_USER: trade_demo
+      POSTGRES_PASSWORD: trade_demo_local
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - trade-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "trade_demo", "-d", "trades"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  trade-db:

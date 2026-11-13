@@ -1,6 +1,8 @@
 using System.Text;
 using Confluent.Kafka;
 using Confluent.Kafka.Admin;
+using Npgsql;
+using TradeReconciliation.KafkaDemo;
 using TradeReconciliation;
 
 const string topic = "trade-reports.demo";
@@ -14,6 +16,16 @@ Console.CancelKeyPress += (_, args) =>
 
 try
 {
+    var connectionString = Environment.GetEnvironmentVariable("TRADE_DB_CONNECTION");
+    await using var database = string.IsNullOrWhiteSpace(connectionString)
+        ? null
+        : NpgsqlDataSource.Create(connectionString);
+    var store = database is null ? null : new PostgresTradeStore(database);
+    if (store is not null)
+    {
+        await store.InitializeAsync(timeout.Token);
+    }
+
     await EnsureTopicAsync(bootstrapServers, topic, timeout.Token);
 
     var tradeRef = $"DEMO-{Guid.NewGuid():N}";
@@ -71,6 +83,11 @@ try
         }
 
         var result = reconciler.Apply(report);
+        if (store is not null)
+        {
+            await store.SaveAsync(report, result, timeout.Token);
+        }
+
         Console.WriteLine($"{report.Source} v{report.Version}: {report.Quantity} shares -> {result.Status}");
         foreach (var quantityBreak in result.Breaks)
         {
@@ -82,16 +99,26 @@ try
     }
 
     consumer.Close();
+    if (store is not null)
+    {
+        Console.WriteLine($"Saved reports and breaks for {tradeRef}.");
+    }
+
     return 0;
 }
 catch (OperationCanceledException)
 {
-    Console.Error.WriteLine("Kafka demo stopped or timed out. Check that the broker is running.");
+    Console.Error.WriteLine("Demo stopped or timed out. Check that Kafka and any configured database are running.");
     return 1;
 }
 catch (KafkaException exception)
 {
     Console.Error.WriteLine($"Kafka demo failed: {exception.Error.Reason}");
+    return 1;
+}
+catch (NpgsqlException exception)
+{
+    Console.Error.WriteLine($"PostgreSQL write failed: {exception.Message}");
     return 1;
 }
 catch (FormatException exception)

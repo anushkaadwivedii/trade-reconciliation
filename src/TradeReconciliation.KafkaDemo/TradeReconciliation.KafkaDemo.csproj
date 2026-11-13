@@ -9,6 +9,8 @@
 
   <ItemGroup>
     <PackageReference Include="Confluent.Kafka" Version="2.16.0" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
     <ProjectReference Include="../TradeReconciliation/TradeReconciliation.csproj" />
+    <EmbeddedResource Include="../../db/migrations/001_trade_history.sql" LogicalName="TradeHistory.sql" />
   </ItemGroup>
 </Project>
