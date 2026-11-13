@@ -5,9 +5,26 @@ using Npgsql;
 using TradeReconciliation.KafkaDemo;
 using TradeReconciliation;
 
-const string topic = "trade-reports.demo";
+var mode = args switch
+{
+    [] => "demo",
+    ["--worker"] => "worker",
+    ["--publish-only"] => "publish",
+    _ => null
+};
+if (mode is null)
+{
+    Console.Error.WriteLine("Usage: TradeReconciliation.KafkaDemo [--worker | --publish-only]");
+    return 2;
+}
+
+var topic = mode == "demo" ? "trade-reports.demo" : "trade-reports.live";
 var bootstrapServers = Environment.GetEnvironmentVariable("KAFKA_BOOTSTRAP_SERVERS") ?? "localhost:9092";
-using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+using var timeout = new CancellationTokenSource();
+if (mode != "worker")
+{
+    timeout.CancelAfter(TimeSpan.FromSeconds(30));
+}
 Console.CancelKeyPress += (_, args) =>
 {
     args.Cancel = true;
@@ -17,7 +34,13 @@ Console.CancelKeyPress += (_, args) =>
 try
 {
     var connectionString = Environment.GetEnvironmentVariable("TRADE_DB_CONNECTION");
-    await using var database = string.IsNullOrWhiteSpace(connectionString)
+    if (mode == "worker" && string.IsNullOrWhiteSpace(connectionString))
+    {
+        Console.Error.WriteLine("Set TRADE_DB_CONNECTION to run the worker.");
+        return 2;
+    }
+
+    await using var database = mode == "publish" || string.IsNullOrWhiteSpace(connectionString)
         ? null
         : NpgsqlDataSource.Create(connectionString);
     var store = database is null ? null : new PostgresTradeStore(database);
@@ -27,6 +50,13 @@ try
     }
 
     await EnsureTopicAsync(bootstrapServers, topic, timeout.Token);
+
+    if (mode == "worker")
+    {
+        var groupId = Environment.GetEnvironmentVariable("KAFKA_CONSUMER_GROUP") ?? "trade-reconciliation-worker";
+        await KafkaTradeWorker.RunAsync(bootstrapServers, topic, groupId, store!, timeout.Token);
+        return 0;
+    }
 
     var tradeRef = $"DEMO-{Guid.NewGuid():N}";
     var reports = new (TradeSource Source, string Payload)[]
@@ -55,6 +85,12 @@ try
         firstOffset ??= delivery.TopicPartitionOffset;
     }
 
+    if (mode == "publish")
+    {
+        Console.WriteLine($"Published three reports for {tradeRef}.");
+        return 0;
+    }
+
     using var consumer = new ConsumerBuilder<string, string>(new ConsumerConfig
     {
         BootstrapServers = bootstrapServers,
@@ -75,13 +111,7 @@ try
             continue;
         }
 
-        var source = ReadSource(message.Headers);
-        var report = TradeReportNormalizer.Normalize(source, message.Value);
-        if (report.TradeRef != message.Key)
-        {
-            throw new FormatException("Kafka key does not match the report's trade reference.");
-        }
-
+        var report = KafkaTradeWorker.ReadReport(message);
         var result = reconciler.Apply(report);
         if (store is not null)
         {
@@ -106,6 +136,10 @@ try
 
     return 0;
 }
+catch (OperationCanceledException) when (mode == "worker" && timeout.IsCancellationRequested)
+{
+    return 0;
+}
 catch (OperationCanceledException)
 {
     Console.Error.WriteLine("Demo stopped or timed out. Check that Kafka and any configured database are running.");
@@ -125,21 +159,6 @@ catch (FormatException exception)
 {
     Console.Error.WriteLine($"Kafka report rejected: {exception.Message}");
     return 1;
-}
-
-static TradeSource ReadSource(Headers? headers)
-{
-    if (headers is null || !headers.TryGetLastBytes("source", out var value) || value is null)
-    {
-        throw new FormatException("Kafka report is missing its source header.");
-    }
-
-    return Encoding.UTF8.GetString(value) switch
-    {
-        nameof(TradeSource.Internal) => TradeSource.Internal,
-        nameof(TradeSource.BrokerA) => TradeSource.BrokerA,
-        _ => throw new FormatException("Kafka report has an unknown source header.")
-    };
 }
 
 static async Task EnsureTopicAsync(string bootstrapServers, string topic, CancellationToken cancellationToken)

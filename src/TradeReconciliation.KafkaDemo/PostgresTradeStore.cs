@@ -33,6 +33,71 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
         await using var connection = await database.OpenConnectionAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
 
+        await WriteAsync(connection, transaction, report, result, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    public async Task<ReconciliationResult?> ApplyAndSaveAsync(
+        TradeReport report,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await database.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+
+        // Serialize updates for the same trade, including during a consumer rebalance.
+        await using var tradeLock = new NpgsqlCommand(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", connection, transaction)
+        {
+            Parameters = { new() { Value = report.TradeRef } }
+        };
+        await tradeLock.ExecuteNonQueryAsync(cancellationToken);
+
+        var reconciler = new TradeReconciler();
+        await using var history = new NpgsqlCommand("""
+            SELECT source, version, quantity
+            FROM trade_reports
+            WHERE trade_ref = $1
+            ORDER BY report_id
+            """, connection, transaction)
+        {
+            Parameters = { new() { Value = report.TradeRef } }
+        };
+
+        await using (var rows = await history.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await rows.ReadAsync(cancellationToken))
+            {
+                var source = Enum.Parse<TradeSource>(rows.GetString(0));
+                var version = rows.GetInt32(1);
+                var quantity = rows.GetInt64(2);
+                if (source == report.Source && version == report.Version)
+                {
+                    if (quantity != report.Quantity)
+                    {
+                        throw new FormatException("Report repeats a saved version with a different quantity.");
+                    }
+
+                    // PostgreSQL already committed this report and its break changes.
+                    return null;
+                }
+
+                reconciler.Apply(new TradeReport(report.TradeRef, source, version, quantity));
+            }
+        }
+
+        var result = reconciler.Apply(report);
+        await WriteAsync(connection, transaction, report, result, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return result;
+    }
+
+    private static async Task WriteAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        TradeReport report,
+        ReconciliationResult result,
+        CancellationToken cancellationToken)
+    {
         const string insertReport = """
             INSERT INTO trade_reports (trade_ref, source, version, quantity, status_after_report)
             VALUES ($1, $2, $3, $4, $5)
@@ -60,8 +125,6 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
         {
             await SaveBreakAsync(connection, transaction, report.TradeRef, quantityBreak, cancellationToken);
         }
-
-        await transaction.CommitAsync(cancellationToken);
     }
 
     private static async Task SaveBreakAsync(

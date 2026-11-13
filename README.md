@@ -72,6 +72,27 @@ WHERE trade_ref = 'DEMO-...';
 
 Run `docker compose down` to stop both services. The named PostgreSQL volume keeps the records for the next startup.
 
+## Run the continuous worker
+
+With Kafka and PostgreSQL running, start the worker in one terminal:
+
+```sh
+TRADE_DB_CONNECTION='Host=localhost;Port=5432;Database=trades;Username=trade_demo;Password=trade_demo_local' \
+  dotnet run --project src/TradeReconciliation.KafkaDemo -- --worker
+```
+
+Publish the three sample reports from a second terminal:
+
+```sh
+dotnet run --project src/TradeReconciliation.KafkaDemo -- --publish-only
+```
+
+The worker listens on `trade-reports.live`, separate from the one-shot demo topic. It uses the `trade-reconciliation-worker` consumer group by default. Keep the group and database the same when restarting so the worker resumes from the saved Kafka offset. Set `KAFKA_CONSUMER_GROUP` for a separate group.
+
+For each report, the worker rebuilds that trade's state from its PostgreSQL history in arrival order, applies the new report, and saves it with its break changes in one transaction. Then it commits the Kafka offset. If the same source and version arrive again with the same quantity, the worker advances the offset without adding another row or changing the break. This is at-least-once delivery with idempotent database writes.
+
+Replaying one trade's history for each new report keeps the recovery logic small for this checkpoint. The worker stops on an invalid message and leaves its offset uncommitted. Dead-letter routing and a more efficient current-state projection are future work.
+
 ## Project status
 
-The local demo sends two JSON feed formats through Kafka, reconciles quantities, and can store reports and breaks in PostgreSQL. Persistent consumer recovery, additional trade rules, and monitoring are planned.
+The project normalizes and reconciles two JSON feeds, publishes reports through Kafka, and stores trade and mismatch history in PostgreSQL. The continuous worker resumes from Kafka's saved position and uses PostgreSQL to rebuild trade state after restart.
