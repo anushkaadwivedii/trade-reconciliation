@@ -91,8 +91,20 @@ The worker listens on `trade-reports.live`, separate from the one-shot demo topi
 
 For each report, the worker rebuilds that trade's state from its PostgreSQL history in arrival order, applies the new report, and saves it with its break changes in one transaction. Then it commits the Kafka offset. If the same source and version arrive again with the same quantity, the worker advances the offset without adding another row or changing the break. This is at-least-once delivery with idempotent database writes.
 
-Replaying one trade's history for each new report keeps the recovery logic small for this checkpoint. The worker stops on an invalid message and leaves its offset uncommitted. Dead-letter routing and a more efficient current-state projection are future work.
+Replaying one trade's history for each new report keeps the recovery logic small for this checkpoint. A more efficient current-state projection is future work.
+
+### Inspect rejected reports
+
+Invalid reports go to `trade-reports.deadletter`. Each entry includes the original Kafka topic, partition, offset, key, JSON text, headers (with binary values encoded as Base64), and the reason for rejection. The worker commits the input offset only after Kafka acknowledges the rejected entry. Kafka or PostgreSQL failures stop processing with the current offset uncommitted.
+
+```sh
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic trade-reports.deadletter --from-beginning \
+  --property print.key=true
+```
+
+A crash after Kafka saves a rejection but before the input offset is committed can publish the same rejection again. The dead-letter key (`topic:partition:offset`) identifies the original Kafka record so consumers can recognize repeated entries.
 
 ## Project status
 
-The project normalizes and reconciles two JSON feeds, publishes reports through Kafka, and stores trade and mismatch history in PostgreSQL. The continuous worker resumes from Kafka's saved position and uses PostgreSQL to rebuild trade state after restart.
+The project normalizes and reconciles two JSON feeds, publishes reports through Kafka, and stores trade and mismatch history in PostgreSQL. The continuous worker resumes from Kafka's saved position and uses PostgreSQL to rebuild trade state after restart. Rejected reports are available in a separate Kafka topic.

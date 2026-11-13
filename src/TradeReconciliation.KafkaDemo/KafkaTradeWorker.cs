@@ -1,10 +1,13 @@
 using System.Text;
+using System.Text.Json;
 using Confluent.Kafka;
 
 namespace TradeReconciliation.KafkaDemo;
 
 internal static class KafkaTradeWorker
 {
+    internal const string DeadLetterTopic = "trade-reports.deadletter";
+
     public static async Task RunAsync(
         string bootstrapServers,
         string topic,
@@ -20,6 +23,13 @@ internal static class KafkaTradeWorker
             EnableAutoCommit = false
         }).Build();
 
+        using var rejectedReports = new ProducerBuilder<string, string>(new ProducerConfig
+        {
+            BootstrapServers = bootstrapServers,
+            EnableIdempotence = true,
+            MessageTimeoutMs = 10_000
+        }).Build();
+
         consumer.Subscribe(topic);
         Console.WriteLine($"Listening on {topic} as {groupId}. Press Ctrl+C to stop.");
 
@@ -28,19 +38,65 @@ internal static class KafkaTradeWorker
             while (!cancellationToken.IsCancellationRequested)
             {
                 var record = consumer.Consume(cancellationToken);
-                var report = ReadReport(record.Message);
-                var result = await store.ApplyAndSaveAsync(report, cancellationToken);
+                string outcome;
+                try
+                {
+                    var report = ReadReport(record.Message);
+                    var result = await store.ApplyAndSaveAsync(report, cancellationToken);
+                    var status = result?.Status.ToString() ?? "Already saved";
+                    outcome = $"{report.TradeRef} {report.Source} v{report.Version}: {status}";
+                }
+                catch (FormatException exception)
+                {
+                    var rejectionId = await PublishRejectionAsync(
+                        rejectedReports, record, exception.Message, cancellationToken);
+                    outcome = $"Rejected {rejectionId}: {exception.Message}";
+                }
 
-                // Advance only after PostgreSQL commits or confirms an identical report.
+                // Advance after PostgreSQL succeeds or Kafka acknowledges the rejection.
                 consumer.Commit(record);
-                var status = result?.Status.ToString() ?? "Already saved";
-                Console.WriteLine($"{report.TradeRef} {report.Source} v{report.Version}: {status}");
+                Console.WriteLine(outcome);
             }
         }
         finally
         {
             consumer.Close();
         }
+    }
+
+    private static async Task<string> PublishRejectionAsync(
+        IProducer<string, string> producer,
+        ConsumeResult<string, string> record,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        var rejectionId = FormattableString.Invariant(
+            $"{record.Topic}:{record.Partition.Value}:{record.Offset.Value}");
+
+        var headers = record.Message.Headers?.Select(header => new
+        {
+            name = header.Key,
+            value = header.GetValueBytes()
+        });
+
+        var rejection = JsonSerializer.Serialize(new
+        {
+            topic = record.Topic,
+            partition = record.Partition.Value,
+            offset = record.Offset.Value,
+            key = record.Message.Key,
+            payload = record.Message.Value,
+            headers,
+            reason
+        });
+
+        await producer.ProduceAsync(DeadLetterTopic, new Message<string, string>
+        {
+            Key = rejectionId,
+            Value = rejection
+        }, cancellationToken);
+
+        return rejectionId;
     }
 
     internal static TradeReport ReadReport(Message<string, string> message)

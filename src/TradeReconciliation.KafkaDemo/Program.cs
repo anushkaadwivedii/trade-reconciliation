@@ -54,6 +54,7 @@ try
     if (mode == "worker")
     {
         var groupId = Environment.GetEnvironmentVariable("KAFKA_CONSUMER_GROUP") ?? "trade-reconciliation-worker";
+        await EnsureTopicAsync(bootstrapServers, KafkaTradeWorker.DeadLetterTopic, timeout.Token);
         await KafkaTradeWorker.RunAsync(bootstrapServers, topic, groupId, store!, timeout.Token);
         return 0;
     }
