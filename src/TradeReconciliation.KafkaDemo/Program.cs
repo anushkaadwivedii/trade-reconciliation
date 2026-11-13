@@ -55,7 +55,16 @@ try
     {
         var groupId = Environment.GetEnvironmentVariable("KAFKA_CONSUMER_GROUP") ?? "trade-reconciliation-worker";
         await EnsureTopicAsync(bootstrapServers, KafkaTradeWorker.DeadLetterTopic, timeout.Token);
-        await KafkaTradeWorker.RunAsync(bootstrapServers, topic, groupId, store!, timeout.Token);
+        var graceSetting = Environment.GetEnvironmentVariable("MISSING_REPORT_GRACE_SECONDS") ?? "30";
+        if (!int.TryParse(graceSetting, System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var graceSeconds))
+        {
+            Console.Error.WriteLine("MISSING_REPORT_GRACE_SECONDS must be a nonnegative whole number.");
+            return 2;
+        }
+
+        await KafkaTradeWorker.RunAsync(
+            bootstrapServers, topic, groupId, store!, TimeSpan.FromSeconds(graceSeconds), timeout.Token);
         return 0;
     }
 

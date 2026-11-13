@@ -30,7 +30,8 @@ public sealed record TradeReport(
     TradeSource Source,
     int Version,
     long Quantity,
-    decimal? Price = null);
+    decimal? Price = null,
+    DateTimeOffset? ExecutionTime = null);
 
 public sealed record QuantityBreak(
     Guid Id,

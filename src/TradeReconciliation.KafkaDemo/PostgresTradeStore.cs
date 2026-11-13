@@ -3,7 +3,7 @@ using NpgsqlTypes;
 
 namespace TradeReconciliation.KafkaDemo;
 
-internal sealed class PostgresTradeStore(NpgsqlDataSource database)
+internal sealed partial class PostgresTradeStore(NpgsqlDataSource database)
 {
     public async Task InitializeAsync(CancellationToken cancellationToken)
     {
@@ -15,7 +15,7 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
             "SELECT pg_advisory_xact_lock(829316054)", connection, transaction);
         await schemaLock.ExecuteNonQueryAsync(cancellationToken);
 
-        foreach (var resource in new[] { "TradeHistory.sql", "PriceHistory.sql" })
+        foreach (var resource in new[] { "TradeHistory.sql", "PriceHistory.sql", "MissingReports.sql" })
         {
             await using var schema = typeof(PostgresTradeStore).Assembly.GetManifestResourceStream(resource)
                 ?? throw new InvalidOperationException($"Missing database schema {resource}.");
@@ -41,22 +41,17 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
 
     public async Task<ReconciliationResult?> ApplyAndSaveAsync(
         TradeReport report,
+        TimeSpan gracePeriod,
         CancellationToken cancellationToken)
     {
         await using var connection = await database.OpenConnectionAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
 
-        // Serialize updates for the same trade, including during a consumer rebalance.
-        await using var tradeLock = new NpgsqlCommand(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", connection, transaction)
-        {
-            Parameters = { new() { Value = report.TradeRef } }
-        };
-        await tradeLock.ExecuteNonQueryAsync(cancellationToken);
+        await LockFeedProgressAsync(connection, transaction, cancellationToken);
 
         var reconciler = new TradeReconciler();
         await using var history = new NpgsqlCommand("""
-            SELECT source, version, quantity, price
+            SELECT source, version, quantity, price, execution_time
             FROM trade_reports
             WHERE trade_ref = $1
             ORDER BY report_id
@@ -73,23 +68,25 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
                 var version = rows.GetInt32(1);
                 var quantity = rows.GetInt64(2);
                 decimal? price = rows.IsDBNull(3) ? null : rows.GetDecimal(3);
+                var executionTime = rows.IsDBNull(4) ? (DateTimeOffset?)null : rows.GetFieldValue<DateTimeOffset>(4);
                 if (source == report.Source && version == report.Version)
                 {
-                    if (quantity != report.Quantity || price != report.Price)
+                    if (quantity != report.Quantity || price != report.Price || executionTime != report.ExecutionTime)
                     {
-                        throw new FormatException("Report repeats a saved version with a different quantity or price.");
+                        throw new FormatException("Report repeats a saved version with different report fields.");
                     }
 
                     // PostgreSQL already committed this report and its break changes.
                     return null;
                 }
 
-                reconciler.Apply(new TradeReport(report.TradeRef, source, version, quantity, price));
+                reconciler.Apply(new TradeReport(report.TradeRef, source, version, quantity, price, executionTime));
             }
         }
 
         var result = reconciler.Apply(report);
         await WriteAsync(connection, transaction, report, result, cancellationToken);
+        await UpdateMissingBreakAsync(connection, transaction, report, gracePeriod, cancellationToken);
         await transaction.CommitAsync(cancellationToken);
         return result;
     }
@@ -102,8 +99,8 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
         CancellationToken cancellationToken)
     {
         const string insertReport = """
-            INSERT INTO trade_reports (trade_ref, source, version, quantity, status_after_report, price)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO trade_reports (trade_ref, source, version, quantity, status_after_report, price, execution_time)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (trade_ref, source, version) DO NOTHING
             """;
 
@@ -116,7 +113,8 @@ internal sealed class PostgresTradeStore(NpgsqlDataSource database)
                 new() { Value = report.Version },
                 new() { Value = report.Quantity },
                 new() { Value = result.Status.ToString() },
-                new() { NpgsqlDbType = NpgsqlDbType.Numeric, Value = (object?)report.Price ?? DBNull.Value }
+                new() { NpgsqlDbType = NpgsqlDbType.Numeric, Value = (object?)report.Price ?? DBNull.Value },
+                new() { NpgsqlDbType = NpgsqlDbType.TimestampTz, Value = (object?)report.ExecutionTime ?? DBNull.Value }
             }
         };
 

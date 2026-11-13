@@ -13,6 +13,7 @@ internal static class KafkaTradeWorker
         string topic,
         string groupId,
         PostgresTradeStore store,
+        TimeSpan gracePeriod,
         CancellationToken cancellationToken)
     {
         using var consumer = new ConsumerBuilder<string, string>(new ConsumerConfig
@@ -41,10 +42,21 @@ internal static class KafkaTradeWorker
                 string outcome;
                 try
                 {
-                    var report = ReadReport(record.Message);
-                    var result = await store.ApplyAndSaveAsync(report, cancellationToken);
-                    var status = result?.Status.ToString() ?? "Already saved";
-                    outcome = $"{report.TradeRef} {report.Source} v{report.Version}: {status}";
+                    var message = record.Message;
+                    if (ReadKind(message.Headers) == "watermark")
+                    {
+                        var source = ReadSource(message.Headers);
+                        var watermark = ReadWatermark(message, source);
+                        var opened = await store.SaveWatermarkAsync(source, watermark, gracePeriod, cancellationToken);
+                        outcome = $"Watermark {source} {watermark:O}: opened {opened} missing-report breaks";
+                    }
+                    else
+                    {
+                        var report = ReadReport(message);
+                        var result = await store.ApplyAndSaveAsync(report, gracePeriod, cancellationToken);
+                        var status = result?.Status.ToString() ?? "Already saved";
+                        outcome = $"{report.TradeRef} {report.Source} v{report.Version}: {status}";
+                    }
                 }
                 catch (FormatException exception)
                 {
@@ -99,22 +111,69 @@ internal static class KafkaTradeWorker
         return rejectionId;
     }
 
-    internal static TradeReport ReadReport(Message<string, string> message)
+    private static string ReadKind(Headers? headers)
     {
-        if (message.Headers is null
-            || !message.Headers.TryGetLastBytes("source", out var value)
+        if (headers is null || !headers.TryGetLastBytes("kind", out var value))
+        {
+            return "report";
+        }
+
+        return value is null ? throw new FormatException("Kafka message kind is null.")
+            : Encoding.UTF8.GetString(value) switch
+            {
+                "report" => "report",
+                "watermark" => "watermark",
+                _ => throw new FormatException("Kafka message has an unknown kind header.")
+            };
+    }
+
+    private static DateTimeOffset ReadWatermark(Message<string, string> message, TradeSource source)
+    {
+        if (message.Key != $"watermark:{source}" || message.Value is null)
+        {
+            throw new FormatException("Watermark requires a payload and a key of watermark:<source>.");
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(message.Value, new JsonDocumentOptions
+            {
+                AllowDuplicateProperties = false
+            });
+            var root = document.RootElement;
+            if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("eventTimeUtc", out var value))
+            {
+                return TradeReportNormalizer.ParseUtcTimestamp(value, "eventTimeUtc");
+            }
+        }
+        catch (JsonException exception)
+        {
+            throw new FormatException("Watermark must be valid JSON with unique property names.", exception);
+        }
+
+        throw new FormatException("Watermark must contain eventTimeUtc.");
+    }
+
+    private static TradeSource ReadSource(Headers? headers)
+    {
+        if (headers is null
+            || !headers.TryGetLastBytes("source", out var value)
             || value is null)
         {
             throw new FormatException("Kafka report is missing its source header.");
         }
 
-        var source = Encoding.UTF8.GetString(value) switch
+        return Encoding.UTF8.GetString(value) switch
         {
             nameof(TradeSource.Internal) => TradeSource.Internal,
             nameof(TradeSource.BrokerA) => TradeSource.BrokerA,
             _ => throw new FormatException("Kafka report has an unknown source header.")
         };
+    }
 
+    internal static TradeReport ReadReport(Message<string, string> message)
+    {
+        var source = ReadSource(message.Headers);
         if (message.Value is null)
         {
             throw new FormatException("Kafka report is missing its payload.");

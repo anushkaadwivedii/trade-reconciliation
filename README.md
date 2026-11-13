@@ -115,7 +115,29 @@ The domain library includes a `MissingReportTracker` for the two feeds. It takes
 
 For example, with a 30-second grace period and an internal trade at 14:00:00, a broker watermark of 14:00:30 leaves the trade waiting. A broker watermark of 14:00:31 opens a break. A later broker report for the same trade resolves it. A break is identified by its trade reference and missing source. Repeated reports and older watermarks do not emit duplicate changes.
 
-The tracker is currently exercised by domain tests. Feed timestamp parsing, watermark delivery through Kafka, and database storage for missing-report breaks are planned.
+The continuous worker accepts optional execution timestamps in `execTimeUtc` for internal reports and `executed_at` for Broker A. Timestamps use UTC with a trailing `Z` and at most six fractional digits. Older reports can omit the timestamp. A report without a timestamp can resolve an existing break, but a trade needs at least one timestamped report before the worker can open a missing-report break.
+
+Set `MISSING_REPORT_GRACE_SECONDS` before starting the worker to change the default of 30 seconds. Keep this setting consistent across worker instances and restarts for the same database. Watermarks are explicit feed messages rather than inferred from the latest report. They share the single-partition `trade-reports.live` topic with the reports so the demo applies them in stream order.
+
+To try it on a fresh demo database and topic, start the worker, then publish these three records. Each line contains the Kafka headers, key, and JSON payload, separated by tabs:
+
+```sh
+printf '%s\t%s\t%s\n' \
+  'source:Internal' 'WATERMARK-DEMO-1' '{"tradeRef":"WATERMARK-DEMO-1","version":1,"quantity":100,"execTimeUtc":"2026-01-05T14:00:00Z"}' \
+  'source:BrokerA,kind:watermark' 'watermark:BrokerA' '{"eventTimeUtc":"2026-01-05T14:00:31Z"}' \
+  'source:BrokerA' 'WATERMARK-DEMO-1' '{"execution_id":"WATERMARK-DEMO-1","revision":1,"qty":100,"executed_at":"2026-01-05T14:00:00Z"}' |
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic trade-reports.live \
+  --property parse.headers=true --property parse.key=true
+```
+
+```sql
+SELECT source, event_time FROM feed_watermarks;
+SELECT trade_ref, missing_source, status, opened_at, resolved_at
+FROM missing_report_breaks WHERE trade_ref = 'WATERMARK-DEMO-1';
+```
+
+PostgreSQL stores each feed's latest watermark and updates the missing-report break in the same transaction as the input that caused the change. The worker acknowledges the Kafka offset afterward. Missing-report breaks have their own history table. The report log's `status_after_report` still describes the quantity and price reconciliation result at arrival.
 
 ## Project status
 

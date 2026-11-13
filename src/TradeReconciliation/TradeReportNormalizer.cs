@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -10,10 +11,10 @@ public static class TradeReportNormalizer
     {
         ArgumentNullException.ThrowIfNull(payload);
 
-        var (referenceField, versionField, quantityField, priceField) = source switch
+        var (referenceField, versionField, quantityField, priceField, timeField) = source switch
         {
-            TradeSource.Internal => ("tradeRef", "version", "quantity", "price"),
-            TradeSource.BrokerA => ("execution_id", "revision", "qty", "px"),
+            TradeSource.Internal => ("tradeRef", "version", "quantity", "price", "execTimeUtc"),
+            TradeSource.BrokerA => ("execution_id", "revision", "qty", "px", "executed_at"),
             _ => throw new ArgumentOutOfRangeException(nameof(source), source, "Unsupported trade source.")
         };
 
@@ -35,12 +36,27 @@ public static class TradeReportNormalizer
                 source,
                 (int)ReadPositiveInteger(root, versionField, int.MaxValue),
                 ReadPositiveInteger(root, quantityField, long.MaxValue),
-                ReadOptionalPrice(root, priceField));
+                ReadOptionalPrice(root, priceField),
+                root.TryGetProperty(timeField, out var timestamp) ? ParseUtcTimestamp(timestamp, timeField) : null);
         }
         catch (JsonException exception)
         {
             throw new FormatException("Trade report must be valid JSON with unique property names.", exception);
         }
+    }
+
+    public static DateTimeOffset ParseUtcTimestamp(JsonElement element, string field)
+    {
+        if (element.ValueKind == JsonValueKind.String
+            && element.GetString() is { } value
+            && Regex.IsMatch(value, @"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?Z\z")
+            && DateTimeOffset.TryParseExact(value, "yyyy-MM-dd'T'HH:mm:ss.FFFFFF'Z'",
+                CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var timestamp))
+        {
+            return timestamp;
+        }
+
+        throw new FormatException($"Field '{field}' must be a UTC timestamp ending in Z with at most six fractional digits.");
     }
 
     private static string ReadTradeReference(JsonElement root, string field)
